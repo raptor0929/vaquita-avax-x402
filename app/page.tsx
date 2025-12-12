@@ -59,6 +59,7 @@ export default function Home() {
   const [amount, setAmount] = useState<number>(QUICK_AMOUNTS[0]);
   const [balance, setBalance] = useState<number>(0);
   const [status, setStatus] = useState<string | null>(null);
+  const [isSubscribing, setIsSubscribing] = useState(false);
   const [isDepositing, setIsDepositing] = useState(false);
   const [isWithdrawing, setIsWithdrawing] = useState(false);
   const [animateCow, setAnimateCow] = useState(false);
@@ -99,19 +100,17 @@ export default function Home() {
     }
   };
 
-  const handleDeposit = async () => {
+  const handleSubscribe = async () => {
     if (!wallet) {
-      setStatus("Connect your wallet to make a premium deposit.");
+      setStatus("Connect your wallet to subscribe.");
       return;
     }
 
-    setIsDepositing(true);
-    setStatus("Requesting premium payment...");
+    setIsSubscribing(true);
+    setStatus("Requesting premium subscription...");
 
     try {
       const normalizedFetch = createNormalizedFetch(AVALANCHE_FUJI_CHAIN_ID);
-      console.log("wallet address: ", {wallet});
-      console.log("account address: ", account?.address);
       const fetchWithPay = wrapFetchWithPayment(normalizedFetch, client, wallet, {
         maxValue: amountInUnits,
       });
@@ -121,84 +120,96 @@ export default function Home() {
 
       if (response.ok) {
         setContent(responseData);
-        setStatus("Premium unlocked. Approving USDC spending...");
-
-        try {
-          // Step 1: Check and approve USDC spending
-          const usdcContract = getContract({
-            client,
-            chain: avalancheFuji,
-            address: USDC_FUJI_ADDRESS,
-            abi: ERC20_ABI as Abi,
-          });
-
-          // Check current allowance
-          const currentAllowance = await readContract({
-            contract: usdcContract,
-            method: "function allowance(address owner, address spender) view returns (uint256)",
-            params: [account?.address as `0x${string}`, MSV_CONTRACT as `0x${string}`],
-          });
-
-          // Approve if allowance is insufficient
-          if (currentAllowance < amountInUnits) {
-            setStatus("Approving USDC spending for MSV...");
-            const approveTx = prepareContractCall({
-              contract: usdcContract,
-              method: "function approve(address spender, uint256 amount) returns (bool)",
-              params: [MSV_CONTRACT as `0x${string}`, amountInUnits],
-            });
-
-            const approveResult = await sendTransaction({
-              account: account!,
-              transaction: approveTx,
-            });
-
-            // Ensure approval is mined before proceeding
-            if (approveResult && typeof (approveResult as any).wait === "function") {
-              await (approveResult as any).wait();
-            }
-
-            // wait 5 seconds
-            await new Promise(resolve => setTimeout(resolve, 5000));
-          }
-
-          // Step 2: Deposit to MSV
-          setStatus("Depositing into Vaquita MSV...");
-          const msvContract = getContract({
-            client,
-            chain: avalancheFuji,
-            address: MSV_CONTRACT,
-            abi: MSV_ABI as Abi,
-          });
-
-          const depositTx = prepareContractCall({
-            contract: msvContract,
-            method: "function deposit(uint256 assets, address receiver) returns (uint256 shares)",
-            params: [amountInUnits, account?.address as `0x${string}`],
-          });
-
-          await sendTransaction({
-            account: account!,
-            transaction: depositTx,
-          });
-
-          // wait 5 seconds
-          await new Promise(resolve => setTimeout(resolve, 5000));
-
-          await fetchVaultBalance();
-          setStatus("Premium unlocked and deposited into Vaquita MSV.");
-          setAnimateCow(true);
-        } catch (depositError) {
-          const errorMsg = depositError instanceof Error ? depositError.message : "Vault deposit failed";
-          setStatus(`Premium paid, but deposit to MSV failed: ${errorMsg}`);
-        }
+        setStatus("Premium subscription successful! You can now deposit to the vault.");
       } else {
-        const errorMsg = responseData.error || "Payment failed";
+        const errorMsg = responseData.error || "Subscription failed";
         setStatus(errorMsg);
       }
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : "Payment error";
+      const errorMsg = error instanceof Error ? error.message : "Subscription error";
       setStatus(errorMsg);
+    } finally {
+      setIsSubscribing(false);
+    }
+  };
+
+  const handleApproveAndDeposit = async () => {
+    if (!account) {
+      setStatus("Connect your wallet first.");
+      return;
+    }
+
+    setIsDepositing(true);
+    setStatus("Approving USDC spending...");
+
+    try {
+      // Step 1: Check and approve USDC spending
+      const usdcContract = getContract({
+        client,
+        chain: avalancheFuji,
+        address: USDC_FUJI_ADDRESS,
+        abi: ERC20_ABI as Abi,
+      });
+
+      // Check current allowance
+      const currentAllowance = await readContract({
+        contract: usdcContract,
+        method: "function allowance(address owner, address spender) view returns (uint256)",
+        params: [account.address as `0x${string}`, MSV_CONTRACT as `0x${string}`],
+      });
+
+      // Approve if allowance is insufficient
+      if (currentAllowance < amountInUnits) {
+        setStatus("Approving USDC spending for MSV...");
+        const approveTx = prepareContractCall({
+          contract: usdcContract,
+          method: "function approve(address spender, uint256 amount) returns (bool)",
+          params: [MSV_CONTRACT as `0x${string}`, amountInUnits],
+        });
+
+        const approveResult = await sendTransaction({
+          account: account,
+          transaction: approveTx,
+        });
+
+        // Ensure approval is mined before proceeding
+        if (approveResult && typeof (approveResult as any).wait === "function") {
+          await (approveResult as any).wait();
+        }
+
+        // Wait for confirmation
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+
+      // Step 2: Deposit to MSV
+      setStatus("Depositing into Vaquita MSV...");
+      const msvContract = getContract({
+        client,
+        chain: avalancheFuji,
+        address: MSV_CONTRACT,
+        abi: MSV_ABI as Abi,
+      });
+
+      const depositTx = prepareContractCall({
+        contract: msvContract,
+        method: "function deposit(uint256 assets, address receiver) returns (uint256 shares)",
+        params: [amountInUnits, account.address as `0x${string}`],
+      });
+
+      await sendTransaction({
+        account: account,
+        transaction: depositTx,
+      });
+
+      // Wait for confirmation
+      await new Promise(resolve => setTimeout(resolve, 5000));
+
+      await fetchVaultBalance();
+      setStatus("Successfully deposited into Vaquita MSV.");
+      setAnimateCow(true);
+    } catch (depositError) {
+      const errorMsg = depositError instanceof Error ? depositError.message : "Deposit failed";
+      setStatus(`Deposit failed: ${errorMsg}`);
     } finally {
       setIsDepositing(false);
     }
@@ -357,19 +368,28 @@ export default function Home() {
                   </p>
                 </div>
 
-                <div className="flex flex-col sm:flex-row gap-3">
-                  <Button
-                    onClick={handleDeposit}
-                    disabled={isDepositing || amount <= 0}
-                    className="flex-1 bg-amber-600 hover:bg-amber-700"
-                  >
-                    {isDepositing ? "Processing..." : "Deposit & Unlock Premium"}
-                  </Button>
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col sm:flex-row gap-3">
+                    <Button
+                      onClick={handleSubscribe}
+                      disabled={isSubscribing || amount <= 0}
+                      className="flex-1 bg-emerald-600 hover:bg-emerald-700"
+                    >
+                      {isSubscribing ? "Subscribing..." : "Subscribe to Premium"}
+                    </Button>
+                    <Button
+                      onClick={handleApproveAndDeposit}
+                      disabled={isDepositing || amount <= 0}
+                      className="flex-1 bg-amber-600 hover:bg-amber-700"
+                    >
+                      {isDepositing ? "Processing..." : "Deposit"}
+                    </Button>
+                  </div>
                   <Button
                     variant="outline"
                     onClick={handleWithdraw}
                     disabled={isWithdrawing || balance <= 0}
-                    className="flex-1 border-amber-200 text-amber-700 hover:bg-amber-50"
+                    className="w-full border-amber-200 text-amber-700 hover:bg-amber-50"
                   >
                     {isWithdrawing ? "Withdrawing..." : "Withdraw"}
                   </Button>

@@ -1,19 +1,44 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { createThirdwebClient } from "thirdweb";
-import { ConnectButton, useActiveWallet, useActiveAccount } from "thirdweb/react";
+import Image from "next/image";
+import { useEffect, useMemo, useState } from "react";
+import { createThirdwebClient, getContract, prepareContractCall, sendTransaction, readContract } from "thirdweb";
+import type { Abi } from "viem";
+import { avalancheFuji } from "thirdweb/chains";
+import { ConnectButton, useActiveAccount, useActiveWallet } from "thirdweb/react";
 import { wrapFetchWithPayment } from "thirdweb/x402";
-import { PaymentCard } from "@/components/payment-card";
-import { ContentDisplay } from "@/components/content-display";
-import { TransactionLog, LogEntry } from "@/components/transaction-log";
-import { ModeNavigation, PaymentMode } from "@/components/mode-navigation";
-import { ScenarioNavigation, AIScenario } from "@/components/scenario-navigation";
-import { ChatInterface } from "@/components/ai-chat/chat-interface";
-import { AgentDashboard } from "@/components/agent/agent-dashboard";
-import { Separator } from "@/components/ui/separator";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { createNormalizedFetch } from "@/lib/payment";
-import { AVALANCHE_FUJI_CHAIN_ID, PAYMENT_AMOUNTS, API_ENDPOINTS } from "@/lib/constants";
+import { AVALANCHE_FUJI_CHAIN_ID, API_ENDPOINTS, USDC_FUJI_ADDRESS } from "@/lib/constants";
+import MSV_ABI from "./MSV.json";
+
+const MSV_CONTRACT = "0x1c3efaAea2772863ff5848A3B09c2b0af48685ec";
+
+// Standard ERC20 ABI for approve and allowance
+const ERC20_ABI = [
+  {
+    inputs: [
+      { internalType: "address", name: "spender", type: "address" },
+      { internalType: "uint256", name: "amount", type: "uint256" },
+    ],
+    name: "approve",
+    outputs: [{ internalType: "bool", name: "", type: "bool" }],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+  {
+    inputs: [
+      { internalType: "address", name: "owner", type: "address" },
+      { internalType: "address", name: "spender", type: "address" },
+    ],
+    name: "allowance",
+    outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+] as const;
+
 
 const client = createThirdwebClient({
   clientId: process.env.NEXT_PUBLIC_THIRDWEB_CLIENT_ID!,
@@ -22,191 +47,353 @@ const client = createThirdwebClient({
 interface ContentData {
   tier: string;
   data: string;
-  features?: string[];
   timestamp: string;
 }
+
+const QUICK_AMOUNTS = [0.1, 0.5, 1];
 
 export default function Home() {
   const wallet = useActiveWallet();
   const account = useActiveAccount();
   const [content, setContent] = useState<ContentData | null>(null);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [isPaying, setIsPaying] = useState(false);
-  const [mode, setMode] = useState<PaymentMode>("human");
-  const [aiScenario, setAIScenario] = useState<AIScenario>("token-chat");
+  const [amount, setAmount] = useState<number>(QUICK_AMOUNTS[0]);
+  const [balance, setBalance] = useState<number>(0);
+  const [status, setStatus] = useState<string | null>(null);
+  const [isDepositing, setIsDepositing] = useState(false);
+  const [isWithdrawing, setIsWithdrawing] = useState(false);
+  const [animateCow, setAnimateCow] = useState(false);
+
+  const amountInUnits = useMemo(
+    () => BigInt(Math.max(0, Math.round(amount * 1_000_000))),
+    [amount]
+  );
 
   useEffect(() => {
-    setLogs([]);
     setContent(null);
+    setStatus(null);
+    fetchVaultBalance();
   }, [wallet, account?.address]);
 
-  const addLog = (message: string, type: LogEntry["type"]) => {
-    setLogs((prev) => [...prev, { message, type, timestamp: new Date() }]);
-  };
+  useEffect(() => {
+    if (!animateCow) return;
+    const timer = setTimeout(() => setAnimateCow(false), 800);
+    return () => clearTimeout(timer);
+  }, [animateCow]);
 
-  const updateLogStatus = (messagePattern: string, newType: LogEntry["type"]) => {
-    setLogs((prev) =>
-      prev.map((log) =>
-        log.message.includes(messagePattern) ? { ...log, type: newType } : log
-      )
-    );
-  };
-
-  const handlePayment = async (tier: "basic" | "premium") => {
-    if (!wallet) return;
-
-    setIsPaying(true);
-    setContent(null);
-    setLogs([]);
+  const fetchVaultBalance = async (opts?: { returnAssets?: boolean }) => {
+    if (!account?.address) {
+      setBalance(0);
+      return opts?.returnAssets ? BigInt(0) : undefined;
+    }
 
     try {
-      addLog(`Initiating ${tier} payment...`, "info");
-
-      const normalizedFetch = createNormalizedFetch(AVALANCHE_FUJI_CHAIN_ID);
-      const fetchWithPay = wrapFetchWithPayment(
-        normalizedFetch,
-        client,
-        wallet,
-        { maxValue: tier === "basic" ? PAYMENT_AMOUNTS.BASIC.bigInt : PAYMENT_AMOUNTS.PREMIUM.bigInt }
-      );
-
-      addLog("Requesting payment authorization...", "info");
-      const response = await fetchWithPay(tier === "basic" ? API_ENDPOINTS.BASIC : API_ENDPOINTS.PREMIUM);
-      const responseData = await response.json();
-
-      if (response.status === 200) {
-        updateLogStatus("Initiating", "success");
-        updateLogStatus("Requesting payment authorization", "success");
-        addLog("Payment successful!", "success");
-        addLog("Content received", "success");
-        setContent(responseData);
-      } else {
-        updateLogStatus("Initiating", "error");
-        updateLogStatus("Requesting payment authorization", "error");
-        const errorMsg = responseData.error || "Unknown error";
-        addLog(`Payment failed: ${errorMsg}`, "error");
-      }
+      const res = await fetch(`/api/balance?address=${account.address}`, { cache: "no-store" });
+      if (!res.ok) throw new Error("Failed to fetch balance");
+      const data = await res.json();
+      const assets = BigInt(data.assets ?? 0);
+      setBalance(Number(data.usdc ?? 0));
+      return opts?.returnAssets ? assets : undefined;
     } catch (error) {
-      updateLogStatus("Initiating", "error");
-      updateLogStatus("Requesting payment authorization", "error");
-      const errorMsg = error instanceof Error ? error.message : "Unknown error";
-      addLog(`Error: ${errorMsg}`, "error");
-    } finally {
-      setIsPaying(false);
+      console.error("Failed to fetch vault balance", error);
+      return opts?.returnAssets ? BigInt(0) : undefined;
     }
   };
 
-  if (!wallet) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100">
-        <div className="text-center space-y-6 p-8">
-          <div>
-            <h1 className="text-4xl font-bold mb-2">x402 Starter Kit</h1>
-            <p className="text-muted-foreground">HTTP 402 Payment Protocol Demo</p>
-            <p className="text-sm text-muted-foreground mt-1">Avalanche Fuji Testnet</p>
-          </div>
-          <ConnectButton client={client} />
-        </div>
-      </div>
-    );
-  }
+  const handleDeposit = async () => {
+    if (!wallet) {
+      setStatus("Connect your wallet to make a premium deposit.");
+      return;
+    }
+
+    setIsDepositing(true);
+    setStatus("Requesting premium payment...");
+
+    try {
+      const normalizedFetch = createNormalizedFetch(AVALANCHE_FUJI_CHAIN_ID);
+      console.log("wallet address: ", {wallet});
+      console.log("account address: ", account?.address);
+      const fetchWithPay = wrapFetchWithPayment(normalizedFetch, client, wallet, {
+        maxValue: amountInUnits,
+      });
+
+      const response = await fetchWithPay(API_ENDPOINTS.PREMIUM);
+      const responseData = await response.json();
+
+      if (response.ok) {
+        setContent(responseData);
+        setStatus("Premium unlocked. Approving USDC spending...");
+
+        try {
+          // Step 1: Check and approve USDC spending
+          const usdcContract = getContract({
+            client,
+            chain: avalancheFuji,
+            address: USDC_FUJI_ADDRESS,
+            abi: ERC20_ABI as Abi,
+          });
+
+          // Check current allowance
+          const currentAllowance = await readContract({
+            contract: usdcContract,
+            method: "function allowance(address owner, address spender) view returns (uint256)",
+            params: [account?.address as `0x${string}`, MSV_CONTRACT as `0x${string}`],
+          });
+
+          // Approve if allowance is insufficient
+          if (currentAllowance < amountInUnits) {
+            setStatus("Approving USDC spending for MSV...");
+            const approveTx = prepareContractCall({
+              contract: usdcContract,
+              method: "function approve(address spender, uint256 amount) returns (bool)",
+              params: [MSV_CONTRACT as `0x${string}`, amountInUnits],
+            });
+
+            const approveResult = await sendTransaction({
+              account: account!,
+              transaction: approveTx,
+            });
+
+            // Ensure approval is mined before proceeding
+            if (approveResult && typeof (approveResult as any).wait === "function") {
+              await (approveResult as any).wait();
+            }
+
+            // wait 5 seconds
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+
+          // Step 2: Deposit to MSV
+          setStatus("Depositing into Vaquita MSV...");
+          const msvContract = getContract({
+            client,
+            chain: avalancheFuji,
+            address: MSV_CONTRACT,
+            abi: MSV_ABI as Abi,
+          });
+
+          const depositTx = prepareContractCall({
+            contract: msvContract,
+            method: "function deposit(uint256 assets, address receiver) returns (uint256 shares)",
+            params: [amountInUnits, account?.address as `0x${string}`],
+          });
+
+          await sendTransaction({
+            account: account!,
+            transaction: depositTx,
+          });
+
+          // wait 5 seconds
+          await new Promise(resolve => setTimeout(resolve, 5000));
+
+          await fetchVaultBalance();
+          setStatus("Premium unlocked and deposited into Vaquita MSV.");
+          setAnimateCow(true);
+        } catch (depositError) {
+          const errorMsg = depositError instanceof Error ? depositError.message : "Vault deposit failed";
+          setStatus(`Premium paid, but deposit to MSV failed: ${errorMsg}`);
+        }
+      } else {
+        const errorMsg = responseData.error || "Payment failed";
+        setStatus(errorMsg);
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Payment error";
+      setStatus(errorMsg);
+    } finally {
+      setIsDepositing(false);
+    }
+  };
+
+  const handleWithdraw = async () => {
+    if (!account) {
+      setStatus("Connect your wallet first.");
+      return;
+    }
+
+    setIsWithdrawing(true);
+    setStatus("Withdrawing from Vaquita MSV...");
+
+    try {
+      const assets = await fetchVaultBalance({ returnAssets: true });
+
+      if (!assets || assets === BigInt(0)) {
+        setStatus("No balance to withdraw yet.");
+        setIsWithdrawing(false);
+        return;
+      }
+
+      const msvContract = getContract({
+        client,
+        chain: avalancheFuji,
+        address: MSV_CONTRACT,
+        abi: MSV_ABI as Abi,
+      });
+
+      const withdrawTx = prepareContractCall({
+        contract: msvContract,
+        method: "function withdraw(uint256 assets, address receiver, address owner) returns (uint256 shares)",
+        params: [assets, account.address as `0x${string}`, account.address as `0x${string}`],
+      });
+
+      await sendTransaction({
+        account: account,
+        transaction: withdrawTx,
+      });
+
+      await fetchVaultBalance();
+      setStatus("Balance withdrawn back to your wallet.");
+      setAnimateCow(true);
+    } catch (withdrawError) {
+      const errorMsg = withdrawError instanceof Error ? withdrawError.message : "Withdrawal failed";
+      setStatus(`Withdrawal failed: ${errorMsg}`);
+    } finally {
+      setIsWithdrawing(false);
+    }
+  };
+
+  const cowScale = 1 + Math.min(balance / 10, 0.35);
+  const shortAddress = account?.address
+    ? `${account.address.slice(0, 6)}...${account.address.slice(-4)}`
+    : null;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
-      <div className="max-w-7xl mx-auto space-y-6">
-        {/* Header */}
-        <div className="text-center space-y-2">
-          <h1 className="text-4xl font-bold">x402 Payment Demo</h1>
-          <p className="text-muted-foreground">HTTP 402 Payment Protocol</p>
-          <div className="flex items-center justify-center gap-2 pt-2">
-            <ConnectButton client={client} />
+    <div className="min-h-screen bg-gradient-to-b from-amber-50 via-orange-50 to-amber-100">
+      <div className="max-w-5xl mx-auto px-4 py-10 space-y-8">
+        <header className="flex flex-wrap items-center justify-between gap-4">
+          <div className="space-y-1">
+            <p className="text-xs uppercase tracking-[0.35em] text-amber-700">Vaquita</p>
+            <h1 className="text-4xl font-bold text-slate-900">Premium Vault</h1>
+            <p className="text-sm text-slate-600">
+              Only premium payments are supported. Deposit to wake the cow.
+            </p>
           </div>
-        </div>
+          <ConnectButton
+              client={client}
+              // TODO: There is a bug in the x402 for smart wallets atm, revise later
+              // accountAbstraction={{
+              //   chain: avalancheFuji, // the chain where your smart accounts will be or is deployed
+              //   sponsorGas: true, // enable or disable sponsored transactions
+              // }}
+          />
+        </header>
 
-        {/* Mode Navigation */}
-        <ModeNavigation activeMode={mode} onModeChange={setMode} />
-
-        <Separator />
-
-        {/* Human Payment Mode */}
-        {mode === "human" && (
-          <>
-            <div className="text-center">
-              <p className="text-muted-foreground">Choose a payment tier to unlock content</p>
-            </div>
-            
-            <div className="flex flex-wrap justify-between gap-6 max-w-4xl mx-auto">
-              <PaymentCard
-                tier="Basic"
-                price="$0.01"
-                description="Perfect for trying out the payment system"
-                onPayClick={() => handlePayment("basic")}
-                isPaying={isPaying}
-              />
-              <PaymentCard
-                tier="Premium"
-                price="$0.15"
-                description="Full access to all advanced features"
-                onPayClick={() => handlePayment("premium")}
-                isPaying={isPaying}
-              />
-            </div>
-
-            {content && (
-              <div className="max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
-                <ContentDisplay
-                  tier={content.tier}
-                  data={content.data}
-                  features={content.features}
-                  timestamp={content.timestamp}
+        <Card className="bg-white/80 border-amber-100 shadow-lg shadow-amber-100/50">
+          <CardContent className="p-6 md:p-8 grid md:grid-cols-2 gap-8 items-center">
+            <div className="flex flex-col items-center gap-4">
+              <div
+                className={`bg-amber-50 border border-amber-100 rounded-2xl p-6 shadow-inner transition-transform duration-300 ${
+                  animateCow ? "cow-shake" : ""
+                }`}
+                style={{ transform: `scale(${cowScale})` }}
+              >
+                <Image
+                  src="/vaquita/vaquita_isotipo.svg"
+                  alt="Vaquita mascot"
+                  width={240}
+                  height={240}
+                  priority
+                  className="drop-shadow-sm"
                 />
               </div>
-            )}
-
-            {logs.length > 0 && (
-              <div className="max-w-4xl mx-auto animate-in fade-in-from-bottom-4 duration-700">
-                <TransactionLog logs={logs} />
+              <div className="text-center space-y-1">
+                <p className="text-sm text-amber-700 font-semibold">Balance</p>
+                <p className="text-3xl font-bold text-slate-900">${balance.toFixed(2)}</p>
+                <p className="text-xs text-muted-foreground">
+                  Cow grows and shakes when you deposit, shrinks when you withdraw.
+                </p>
               </div>
-            )}
-          </>
-        )}
+            </div>
 
-        {/* AI Agent Mode */}
-        {mode === "ai-agent" && (
-          <div className="space-y-6">
-            {/* Scenario Navigation */}
-            <ScenarioNavigation 
-              activeScenario={aiScenario} 
-              onScenarioChange={setAIScenario} 
-            />
-
-            {/* Token-Based Chat */}
-            {aiScenario === "token-chat" && (
-              <div className="space-y-4">
-                <div className="text-center">
-                  <h2 className="text-xl font-semibold">Token-Based AI Chat</h2>
-                  <p className="text-sm text-muted-foreground">
-                    Pay per message based on actual token usage
+            <div className="space-y-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-slate-800">Deposit to Vaquita</p>
+                  <p className="text-xs text-muted-foreground">
+                    Premium-only payment. On-chain price stays at $0.01 USDC.
                   </p>
                 </div>
-                <ChatInterface />
+                {shortAddress && (
+                  <span className="text-xs font-mono bg-amber-50 text-amber-800 px-2 py-1 rounded-md border border-amber-100">
+                    {shortAddress}
+                  </span>
+                )}
               </div>
-            )}
 
-            {/* Autonomous Agents */}
-            {aiScenario === "autonomous-agents" && (
-              <div className="space-y-4">
-                <div className="text-center">
-                  <h2 className="text-xl font-semibold">Autonomous AI Agent</h2>
-                  <p className="text-sm text-muted-foreground">
-                    Pre-authorize a budget, agent pays automatically
+              <div className="space-y-2">
+                <label className="text-xs uppercase font-semibold text-slate-500">
+                  Amount (USDC)
+                </label>
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={amount}
+                      onChange={(e) => setAmount(Number(e.target.value) || 0)}
+                      className="w-28 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm shadow-sm focus:border-amber-400 focus:outline-none focus:ring-2 focus:ring-amber-200"
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      {QUICK_AMOUNTS.map((value) => (
+                        <Button
+                          key={value}
+                          type="button"
+                          size="sm"
+                          variant={amount === value ? "default" : "outline"}
+                          onClick={() => setAmount(value)}
+                          className={
+                            amount === value
+                              ? "bg-amber-600 hover:bg-amber-700"
+                              : "border-amber-200 text-amber-700 hover:bg-amber-50"
+                          }
+                        >
+                          ${value.toFixed(2)}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Payments go through thirdweb 402. We cap spending to your chosen deposit.
                   </p>
                 </div>
-                <AgentDashboard />
+
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <Button
+                    onClick={handleDeposit}
+                    disabled={isDepositing || amount <= 0}
+                    className="flex-1 bg-amber-600 hover:bg-amber-700"
+                  >
+                    {isDepositing ? "Processing..." : "Deposit & Unlock Premium"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={handleWithdraw}
+                    disabled={isWithdrawing || balance <= 0}
+                    className="flex-1 border-amber-200 text-amber-700 hover:bg-amber-50"
+                  >
+                    {isWithdrawing ? "Withdrawing..." : "Withdraw"}
+                  </Button>
+                </div>
+
+                {status && (
+                  <div className="rounded-lg border border-amber-100 bg-amber-50 text-amber-800 text-sm px-3 py-2">
+                    {status}
+                  </div>
+                )}
+
+                {content && (
+                  <div className="rounded-lg border border-emerald-100 bg-emerald-50 text-emerald-800 text-sm px-3 py-2 space-y-1">
+                    <p className="font-semibold">Premium unlocked</p>
+                    <p>{content.data}</p>
+                    <p className="text-xs text-emerald-700">
+                      Updated: {new Date(content.timestamp).toLocaleString()}
+                    </p>
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-        )}
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );
